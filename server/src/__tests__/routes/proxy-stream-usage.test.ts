@@ -85,6 +85,48 @@ function sseResponseWithUsage() {
   };
 }
 
+/** SSE Response with usage-only frame emitted MID-STREAM (before the finish chunk). */
+function sseResponseUsageMidStream() {
+  const encoder = new TextEncoder();
+  const frames = [
+    `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"hel"},"finish_reason":null}]}\n\n`,
+    `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}}\n\n`,
+    `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":null}]}\n\n`,
+    `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n`,
+    'data: [DONE]\n\n',
+  ];
+  return {
+    ok: true,
+    body: new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const f of frames) controller.enqueue(encoder.encode(f));
+        controller.close();
+      },
+    }),
+    headers: new Headers(),
+  };
+}
+
+/** SSE Response with usage attached to a CONTENT frame (non-final position). */
+function sseResponseUsageOnContentFrame() {
+  const encoder = new TextEncoder();
+  const frames = [
+    `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}}\n\n`,
+    `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n`,
+    'data: [DONE]\n\n',
+  ];
+  return {
+    ok: true,
+    body: new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const f of frames) controller.enqueue(encoder.encode(f));
+        controller.close();
+      },
+    }),
+    headers: new Headers(),
+  };
+}
+
 function usageFrames(raw: string) {
   return raw
     .split('\n\n')
@@ -186,6 +228,72 @@ describe('Streaming usage-frame fallback injection', () => {
     }, authHeaders());
 
     expect(status).toBe(200);
+    const frames = usageFrames(raw);
+    expect(frames).toHaveLength(1);
+    expect(frames[0].usage).toEqual({
+      prompt_tokens: 11,
+      completion_tokens: 2,
+      total_tokens: 13,
+    });
+  });
+
+  it('does NOT inject an estimate when the upstream emits a usage frame mid-stream (non-final position)', async () => {
+    const origFetch = global.fetch;
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      if (urlStr.includes('api.groq.com/openai/v1/chat/completions')) {
+        return sseResponseUsageMidStream() as any;
+      }
+      return origFetch(url, init);
+    });
+
+    const { status, raw } = await request(app, 'POST', '/v1/chat/completions', {
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: true,
+      stream_options: { include_usage: true },
+    }, authHeaders());
+
+    expect(status).toBe(200);
+    // The upstream's real mid-stream frame must be the ONLY usage frame —
+    // no estimate injected on top of it.
+    const frames = usageFrames(raw);
+    expect(frames).toHaveLength(1);
+    expect(frames[0].usage).toEqual({
+      prompt_tokens: 11,
+      completion_tokens: 2,
+      total_tokens: 13,
+    });
+    // Stream must still carry the full content ("hel" + "lo").
+    const allFrames = raw
+      .split('\n\n')
+      .filter((l) => l.startsWith('data:'))
+      .map((l) => l.slice(5).trim())
+      .filter((p) => p !== '[DONE]')
+      .map((p) => JSON.parse(p));
+    const content = allFrames
+      .flatMap((f) => f.choices?.map((c: any) => c.delta?.content ?? '') ?? [])
+      .join('');
+    expect(content).toBe('hello');
+  });
+
+  it('does NOT inject an estimate when usage rides on a content frame (non-final position)', async () => {
+    const origFetch = global.fetch;
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      if (urlStr.includes('api.groq.com/openai/v1/chat/completions')) {
+        return sseResponseUsageOnContentFrame() as any;
+      }
+      return origFetch(url, init);
+    });
+
+    const { status, raw } = await request(app, 'POST', '/v1/chat/completions', {
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: true,
+      stream_options: { include_usage: true },
+    }, authHeaders());
+
+    expect(status).toBe(200);
+    // Real usage must be preserved and the estimate must NOT fire.
     const frames = usageFrames(raw);
     expect(frames).toHaveLength(1);
     expect(frames[0].usage).toEqual({
