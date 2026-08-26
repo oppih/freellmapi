@@ -190,6 +190,9 @@ describe('Streaming usage-frame fallback injection', () => {
     expect(frames[0].usage.total_tokens).toBe(
       frames[0].usage.prompt_tokens + frames[0].usage.completion_tokens,
     );
+    // Synthetic counts are flagged: a client doing cost accounting can tell
+    // this block apart from an upstream's real one.
+    expect(frames[0].usage.estimated).toBe(true);
   });
 
   it('does NOT inject a usage frame when include_usage is not requested', async () => {
@@ -235,6 +238,8 @@ describe('Streaming usage-frame fallback injection', () => {
       completion_tokens: 2,
       total_tokens: 13,
     });
+    // Real upstream counts are never relabelled as estimates.
+    expect(frames[0].usage).not.toHaveProperty('estimated');
   });
 
   it('does NOT inject an estimate when the upstream emits a usage frame mid-stream (non-final position)', async () => {

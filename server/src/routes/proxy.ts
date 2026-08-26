@@ -2294,6 +2294,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             ? 'tool_calls'
             : (upstreamFinish && upstreamFinish !== 'tool_calls' ? upstreamFinish : 'stop');
           writeChunk(mkChunk({}, finish));
+          // One prompt-token estimate for both the injected usage frame below
+          // and the accounting fallback after it, so a client that reads the
+          // frame and the row this request writes can never disagree. Images
+          // are billed at the same flat per-image estimate the routing budget
+          // uses (the chars/4 pass sees text only).
+          const estimatedPromptTokens = estimatedInputTokens + injectedHandoffTokens + imageCount * IMAGE_TOKEN_ESTIMATE;
           if (usageChunk) {
             writeChunk(usageChunk);
           } else if (parsed.data.stream_options?.include_usage) {
@@ -2301,20 +2307,14 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             // a final usage frame even when stream_options.include_usage is
             // requested. Strict clients (Hermes, Cline, Continue) treat a
             // missing usage block as "no accounting happened" and skip
-            // per-call token/cost/billing_provider writes entirely. Inject the
-            // proxy's own estimate (same values the non-stream path already
-            // reports via the `?? estimatedInputTokens` fallback above) so
-            // streaming clients still receive a usage block.
+            // per-call token/cost/billing_provider writes entirely.
             //
-            // NOTE: this frame is an ESTIMATE, not the upstream's final
-            // accounting. The OpenAI wire format has no standard flag for
-            // estimated usage, and adding a custom field here could break
-            // strict clients that reject unknown usage keys — the very
-            // clients this injection exists for. Consumers doing cost
-            // accounting should treat a usage frame on a usage-less upstream
-            // as approximate (token counts are length/4 heuristics, matching
-            // the proxy's non-streaming estimate path).
-            const promptTokens = estimatedInputTokens + injectedHandoffTokens;
+            // Injected ONLY when the client asked for usage via
+            // stream_options.include_usage AND the upstream never sent one;
+            // the numbers are this gateway's own chars/4 estimate (the same
+            // total the accounting below records), never the upstream's
+            // accounting, so the block is flagged `estimated: true` rather
+            // than passed off as real counts.
             const completionTokens = totalOutputTokens;
             writeChunk({
               id: lastMeta.id ?? `chatcmpl-${Date.now()}`,
@@ -2323,9 +2323,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
               model: lastMeta.model ?? route.modelId,
               choices: [],
               usage: {
-                prompt_tokens: promptTokens,
+                prompt_tokens: estimatedPromptTokens,
                 completion_tokens: completionTokens,
-                total_tokens: promptTokens + completionTokens,
+                total_tokens: estimatedPromptTokens + completionTokens,
+                estimated: true,
               },
             });
           }
@@ -2333,7 +2334,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           res.end();
 
           const upstreamUsage = (usageChunk as { usage?: TokenUsage } | null)?.usage;
-          const inputTokens = upstreamUsage?.prompt_tokens ?? (estimatedInputTokens + injectedHandoffTokens);
+          const inputTokens = upstreamUsage?.prompt_tokens ?? estimatedPromptTokens;
           const outputTokens = upstreamUsage?.completion_tokens ?? totalOutputTokens;
           const totalTokens = upstreamUsage?.total_tokens ?? (inputTokens + outputTokens);
           recordUpstreamSuccess(route, totalTokens);
